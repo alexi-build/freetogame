@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Action, ActionPanel, Keyboard, List } from "@raycast/api";
+import { Action, ActionPanel, Cache, Keyboard, List } from "@raycast/api";
 import { useFetch } from "@raycast/utils";
 
 const API_BASE_URL = "https://www.freetogame.com/api";
 const FREETOGAME_URL = "https://www.freetogame.com";
+const gameDetailCache = new Cache({ namespace: "game-details" });
 
 const CATEGORY_LABELS = {
   mmorpg: "MMORPG",
@@ -77,11 +78,35 @@ type FreeToGameListItem = {
 
 type FreeToGameListResponse = FreeToGameListItem[] | { status: number; status_message: string };
 
+type FreeToGameScreenshot = {
+  id: number;
+  image: string;
+};
+
+type FreeToGameSystemRequirements = {
+  os?: string;
+  processor?: string;
+  memory?: string;
+  graphics?: string;
+  storage?: string;
+};
+
+type FreeToGameDetail = FreeToGameListItem & {
+  status: string;
+  description: string;
+  minimum_system_requirements?: FreeToGameSystemRequirements;
+  screenshots?: FreeToGameScreenshot[];
+};
+
+type FreeToGameDetailResponse = FreeToGameDetail | { status: number; status_message: string };
+
 export default function Command() {
   const [platform, setPlatform] = useState<PlatformValue>();
   const [categories, setCategories] = useState<CategoryValue[]>([]);
   const [sort, setSort] = useState<SortValue>();
   const [showingDetail, setShowingDetail] = useState(false);
+  const [showingMetadata, setShowingMetadata] = useState(false);
+  const [selectedGameId, setSelectedGameId] = useState<string | null>(null);
   const {
     data: games,
     isLoading,
@@ -115,43 +140,58 @@ export default function Command() {
   }
 
   const gameCount = sortedGames?.length ?? 0;
+  const activeGameId = sortedGames?.some((game) => String(game.id) === selectedGameId)
+    ? selectedGameId
+    : sortedGames?.[0]
+      ? String(sortedGames[0].id)
+      : undefined;
 
   return (
     <List
       isLoading={isLoading}
       isShowingDetail={showingDetail}
+      onSelectionChange={setSelectedGameId}
       searchBarPlaceholder={`Search ${gameCount} free-to-play ${gameCount === 1 ? "game" : "games"}...`}
       searchBarAccessory={<PlatformDropdown platform={platform} onPlatformChange={setPlatform} />}
     >
-      {sortedGames?.map((game) => (
-        <List.Item
-          key={game.id}
-          title={game.title}
-          subtitle={showingDetail ? undefined : game.short_description}
-          icon={{ source: game.thumbnail }}
-          accessories={showingDetail ? undefined : [{ text: game.genre }, { text: game.platform }]}
-          keywords={[game.genre, game.platform, game.publisher, game.developer]}
-          detail={showingDetail ? <GameListDetail game={game} /> : undefined}
-          actions={
-            <GameActions
-              game={game}
-              showingDetail={showingDetail}
-              onToggleDetail={() => setShowingDetail(!showingDetail)}
-              categories={categories}
-              onToggleCategory={(category) =>
-                setCategories((categories) =>
-                  categories.includes(category)
-                    ? categories.filter((selectedCategory) => selectedCategory !== category)
-                    : [...categories, category],
-                )
-              }
-              onClearCategories={() => setCategories([])}
-              sort={sort}
-              onSortChange={setSort}
-            />
-          }
-        />
-      ))}
+      {sortedGames?.map((game) => {
+        const isSelected = String(game.id) === activeGameId;
+
+        return (
+          <List.Item
+            id={String(game.id)}
+            key={game.id}
+            title={game.title}
+            subtitle={showingDetail ? undefined : game.short_description}
+            icon={{ source: game.thumbnail }}
+            accessories={showingDetail ? undefined : [{ text: game.genre }, { text: game.platform }]}
+            keywords={[game.genre, game.platform, game.publisher, game.developer]}
+            detail={
+              showingDetail && isSelected ? <GameDetail game={game} showingMetadata={showingMetadata} /> : undefined
+            }
+            actions={
+              <GameActions
+                game={game}
+                showingDetail={showingDetail}
+                showingMetadata={showingMetadata}
+                onToggleDetail={() => setShowingDetail(!showingDetail)}
+                onToggleMetadata={() => setShowingMetadata(!showingMetadata)}
+                categories={categories}
+                onToggleCategory={(category) =>
+                  setCategories((categories) =>
+                    categories.includes(category)
+                      ? categories.filter((selectedCategory) => selectedCategory !== category)
+                      : [...categories, category],
+                  )
+                }
+                onClearCategories={() => setCategories([])}
+                sort={sort}
+                onSortChange={setSort}
+              />
+            }
+          />
+        );
+      })}
       {!isLoading && sortedGames?.length === 0 ? (
         <List.EmptyView title="No games found" description="Try another filter." />
       ) : null}
@@ -182,7 +222,9 @@ function PlatformDropdown({
 function GameActions({
   game,
   showingDetail,
+  showingMetadata,
   onToggleDetail,
+  onToggleMetadata,
   categories,
   onToggleCategory,
   onClearCategories,
@@ -191,7 +233,9 @@ function GameActions({
 }: {
   game: FreeToGameListItem;
   showingDetail: boolean;
+  showingMetadata: boolean;
   onToggleDetail: () => void;
+  onToggleMetadata: () => void;
   categories: CategoryValue[];
   onToggleCategory: (category: CategoryValue) => void;
   onClearCategories: () => void;
@@ -201,6 +245,13 @@ function GameActions({
   return (
     <ActionPanel>
       <Action title={showingDetail ? "Hide Details" : "Show Details"} onAction={onToggleDetail} />
+      {showingDetail ? (
+        <Action
+          title={showingMetadata ? "Hide Metadata" : "Show Metadata"}
+          onAction={onToggleMetadata}
+          shortcut={Keyboard.Shortcut.Common.ToggleQuickLook}
+        />
+      ) : null}
       <ActionPanel.Submenu title="Filter Categories" shortcut={Keyboard.Shortcut.Common.Copy}>
         {categories.length > 0 ? (
           <Action title="Clear Categories" onAction={onClearCategories} shortcut={Keyboard.Shortcut.Common.RemoveAll} />
@@ -264,16 +315,71 @@ function GameActions({
   );
 }
 
-function GameListDetail({ game }: { game: FreeToGameListItem }) {
+function GameDetail({ game, showingMetadata }: { game: FreeToGameListItem; showingMetadata: boolean }) {
+  const cachedDetail = readCachedGameDetail(game.id);
+  const { data, isLoading } = useFetch<FreeToGameDetailResponse>(buildGameDetailUrl(game.id), {
+    execute: !cachedDetail,
+    keepPreviousData: true,
+    onData: (data) => {
+      if (isValidGameDetail(data)) {
+        cacheGameDetail(data);
+      }
+    },
+  });
+  const fetchedDetail = isValidGameDetail(data) && data.id === game.id ? data : undefined;
+  const displayGame = cachedDetail ?? fetchedDetail ?? game;
+
   return (
     <List.Item.Detail
-      markdown={`# ${game.title}
+      isLoading={isLoading}
+      markdown={buildGameDetailMarkdown(displayGame)}
+      metadata={showingMetadata ? <GameDetailMetadata game={displayGame} /> : undefined}
+    />
+  );
+}
+
+function GameDetailMetadata({ game }: { game: FreeToGameListItem | FreeToGameDetail }) {
+  const requirements = "minimum_system_requirements" in game ? game.minimum_system_requirements : undefined;
+
+  return (
+    <List.Item.Detail.Metadata>
+      <List.Item.Detail.Metadata.Label title="Genre" text={game.genre} />
+      <List.Item.Detail.Metadata.Label title="Platform" text={game.platform} />
+      <List.Item.Detail.Metadata.Label title="Publisher" text={game.publisher} />
+      <List.Item.Detail.Metadata.Label title="Developer" text={game.developer} />
+      <List.Item.Detail.Metadata.Label title="Release Date" text={game.release_date} />
+      {"status" in game ? <List.Item.Detail.Metadata.Label title="Status" text={game.status} /> : null}
+      {requirements ? (
+        <>
+          <List.Item.Detail.Metadata.Separator />
+          <List.Item.Detail.Metadata.Label title="OS" text={requirements.os ?? "Unknown"} />
+          <List.Item.Detail.Metadata.Label title="Processor" text={requirements.processor ?? "Unknown"} />
+          <List.Item.Detail.Metadata.Label title="Memory" text={requirements.memory ?? "Unknown"} />
+          <List.Item.Detail.Metadata.Label title="Graphics" text={requirements.graphics ?? "Unknown"} />
+          <List.Item.Detail.Metadata.Label title="Storage" text={requirements.storage ?? "Unknown"} />
+        </>
+      ) : null}
+      <List.Item.Detail.Metadata.Separator />
+      <List.Item.Detail.Metadata.Link title="Game Website" target={game.game_url} text="Open" />
+      <List.Item.Detail.Metadata.Link title="FreeToGame Profile" target={game.freetogame_profile_url} text="Open" />
+    </List.Item.Detail.Metadata>
+  );
+}
+
+function buildGameDetailMarkdown(game: FreeToGameListItem | FreeToGameDetail) {
+  const description = "description" in game ? game.description : game.short_description;
+  const screenshots = "screenshots" in game ? (game.screenshots ?? []) : [];
+  const screenshotsMarkdown = screenshots
+    .map((screenshot, index) => `![Screenshot ${index + 1}](${screenshot.image})`)
+    .join("\n\n");
+
+  return `# ${game.title}
 
 ![${game.title}](${game.thumbnail})
 
-${game.short_description}
+${description}
 
-## Links
+${screenshotsMarkdown ? `## Screenshots\n\n${screenshotsMarkdown}\n\n` : ""}## Links
 
 [Play Now](${game.game_url})
 
@@ -282,22 +388,44 @@ ${game.short_description}
 ---
 
 Data source: [FreeToGame.com](${FREETOGAME_URL})
-`}
-      metadata={<GameListMetadata game={game} />}
-    />
-  );
+`;
 }
 
-function GameListMetadata({ game }: { game: FreeToGameListItem }) {
-  return (
-    <List.Item.Detail.Metadata>
-      <List.Item.Detail.Metadata.Label title="Genre" text={game.genre} />
-      <List.Item.Detail.Metadata.Label title="Platform" text={game.platform} />
-      <List.Item.Detail.Metadata.Label title="Publisher" text={game.publisher} />
-      <List.Item.Detail.Metadata.Label title="Developer" text={game.developer} />
-      <List.Item.Detail.Metadata.Label title="Release Date" text={game.release_date} />
-    </List.Item.Detail.Metadata>
-  );
+function isValidGameDetail(data: FreeToGameDetailResponse | undefined): data is FreeToGameDetail {
+  return Boolean(data && "id" in data && "description" in data);
+}
+
+function readCachedGameDetail(gameId: number) {
+  const cacheKey = getGameDetailCacheKey(gameId);
+  const cachedDetail = gameDetailCache.get(cacheKey);
+
+  if (!cachedDetail) {
+    return undefined;
+  }
+
+  try {
+    const detail = JSON.parse(cachedDetail) as FreeToGameDetailResponse;
+
+    if (isValidGameDetail(detail) && detail.id === gameId) {
+      return detail;
+    }
+  } catch {
+    gameDetailCache.remove(cacheKey);
+  }
+
+  return undefined;
+}
+
+function cacheGameDetail(detail: FreeToGameDetail) {
+  gameDetailCache.set(getGameDetailCacheKey(detail.id), JSON.stringify(detail));
+}
+
+function getGameDetailCacheKey(gameId: number) {
+  return String(gameId);
+}
+
+function buildGameDetailUrl(gameId: number) {
+  return `${API_BASE_URL}/game?id=${gameId}`;
 }
 
 function buildGamesUrl(platform: PlatformValue | undefined, categories: CategoryValue[], sort: SortValue | undefined) {
